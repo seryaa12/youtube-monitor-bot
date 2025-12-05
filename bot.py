@@ -272,9 +272,10 @@ async def fetch_youtube_data(url):
     return None
 
 async def extract_youtube_info(url):
-    """Extrai informações do canal"""
+    """Extrai informações do canal - VERSÃO 2024 OTIMIZADA"""
     html = await fetch_youtube_data(url)
     if not html:
+        print(f"❌ Não foi possível obter HTML de {url}")
         return None
     
     info = {
@@ -289,76 +290,270 @@ async def extract_youtube_info(url):
     }
     
     try:
-        # Extrai nome do canal
-        name_match = re.search(r'"channelName":"([^"]+)"', html)
-        if name_match:
-            info['channel_name'] = name_match.group(1)
-        else:
-            title_match = re.search(r'<title>([^<]+)</title>', html)
-            if title_match:
-                info['channel_name'] = title_match.group(1).replace(' - YouTube', '').strip()
+        print(f"🔍 Analisando HTML de {url}...")
         
-        # Extrai ID do canal
-        channel_id_match = re.search(r'"channelId":"([^"]+)"', html)
-        if channel_id_match:
-            info['channel_id'] = channel_id_match.group(1)
+        # ========== MÉTODO 1: Busca por JSON ytInitialData ==========
+        # O YouTube armazena dados em um JSON gigante chamado ytInitialData
+        initial_data_match = re.search(r'var ytInitialData\s*=\s*({.*?});', html, re.DOTALL)
         
-        # Verifica live
-        if '"isLiveBroadcast":true' in html or '"isLive":true' in html:
-            info['is_live'] = True
-            
-            # Extrai informações da live
-            live_match = re.search(r'"videoId":"([^"]+)"[^}]*"title":"([^"]+)"[^}]*"isLive":true', html)
-            if live_match:
-                info['live_info'] = {
-                    'id': live_match.group(1),
-                    'title': live_match.group(2).replace('\\"', '"'),
-                    'url': f"https://youtu.be/{live_match.group(1)}",
-                    'thumbnail': f"https://img.youtube.com/vi/{live_match.group(1)}/maxresdefault.jpg",
-                    'type': 'live'
-                }
-        
-        # Verifica lives programadas
-        scheduled_match = re.search(r'"upcomingEventData":\{[^}]+\"videoId\":\"([^"]+)\"[^}]+\"startTime\":\"([^"]+)\"[^}]+\"title\":\"([^"]+)\"', html)
-        if scheduled_match:
+        if initial_data_match:
             try:
-                dt = datetime.fromtimestamp(int(scheduled_match.group(2)))
-                formatted_time = dt.strftime("%d/%m/%Y %H:%M")
-            except:
-                formatted_time = scheduled_match.group(2)
+                print("📊 Tentando extrair via JSON ytInitialData...")
+                data = json.loads(initial_data_match.group(1))
+                
+                # Função para buscar informações recursivamente no JSON
+                def search_in_json(obj, path=""):
+                    if isinstance(obj, dict):
+                        # Procura por nome do canal
+                        if 'title' in obj:
+                            title_data = obj['title']
+                            if 'runs' in title_data and title_data['runs']:
+                                runs = title_data['runs']
+                                for run in runs:
+                                    if 'text' in run:
+                                        info['channel_name'] = run['text']
+                                        break
+                            elif 'simpleText' in title_data:
+                                info['channel_name'] = title_data['simpleText']
+                        
+                        # Procura por ID do canal
+                        if 'channelId' in obj:
+                            info['channel_id'] = obj['channelId']
+                        elif 'browseId' in obj and 'UC' in str(obj['browseId']):
+                            info['channel_id'] = obj['browseId']
+                        
+                        # Procura por live
+                        if obj.get('isLive') is True or obj.get('style') == 'LIVE':
+                            info['is_live'] = True
+                            if 'videoId' in obj:
+                                video_id = obj['videoId']
+                                title = obj.get('title', {})
+                                title_text = ""
+                                
+                                if 'runs' in title and title['runs']:
+                                    title_text = title['runs'][0].get('text', '')
+                                elif 'simpleText' in title:
+                                    title_text = title['simpleText']
+                                
+                                info['live_info'] = {
+                                    'id': video_id,
+                                    'title': title_text,
+                                    'url': f"https://youtu.be/{video_id}",
+                                    'thumbnail': f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
+                                    'type': 'live'
+                                }
+                        
+                        # Procura por vídeos
+                        if 'videoId' in obj and 'title' in obj:
+                            video_id = obj['videoId']
+                            title_data = obj['title']
+                            title_text = ""
+                            
+                            if 'runs' in title_data and title_data['runs']:
+                                title_text = title_data['runs'][0].get('text', '')
+                            elif 'simpleText' in title_data:
+                                title_text = title_data['simpleText']
+                            
+                            # É o primeiro vídeo encontrado?
+                            if not info['latest_video']:
+                                info['latest_video'] = {
+                                    'id': video_id,
+                                    'title': title_text,
+                                    'thumbnail': f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
+                                    'url': f"https://youtu.be/{video_id}",
+                                    'publish_time': 'Recentemente',
+                                    'type': 'video'
+                                }
+                            
+                            # Adiciona à lista de vídeos recentes
+                            info['recent_videos'].append({
+                                'id': video_id,
+                                'title': title_text,
+                                'thumbnail': f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
+                                'url': f"https://youtu.be/{video_id}",
+                                'publish_time': 'Recentemente',
+                                'type': 'video'
+                            })
+                        
+                        # Busca recursivamente
+                        for key, value in obj.items():
+                            if key not in ['thumbnail', 'avatar', 'image']:  # Pula grandes objetos
+                                search_in_json(value, f"{path}.{key}")
+                    
+                    elif isinstance(obj, list):
+                        for item in obj:
+                            search_in_json(item, path)
+                
+                # Executa a busca
+                search_in_json(data)
+                print(f"✅ JSON analisado: {info['channel_name']} (ID: {info['channel_id']})")
+                
+            except json.JSONDecodeError as e:
+                print(f"⚠️ Erro ao decodificar JSON: {e}")
+            except Exception as e:
+                print(f"⚠️ Erro no método JSON: {e}")
+        
+        # ========== MÉTODO 2: Regex modernas para 2024 ==========
+        # Se o JSON não funcionou, usa regex atualizadas
+        
+        # 1. Extrai nome do canal (múltiplas tentativas)
+        name_patterns = [
+            r'<meta property="og:title" content="([^"]+)"',
+            r'<meta name="title" content="([^"]+)"',
+            r'<title>([^<]+) - YouTube</title>',
+            r'"author":"([^"]+)"',
+            r'"channelName":"([^"]+)"',
+            r'"title":"([^"]+)"[^}]*"canonicalBaseUrl":"/@[^"]+"',
+            r'"header":"c4TabbedHeaderRenderer"[^}]+"title":"([^"]+)"',
+        ]
+        
+        for pattern in name_patterns:
+            match = re.search(pattern, html, re.IGNORECASE)
+            if match:
+                name = match.group(1).strip()
+                if name and len(name) > 2 and 'YouTube' not in name:
+                    info['channel_name'] = name.replace(' - YouTube', '').replace('\\"', '"')
+                    print(f"✅ Nome encontrado via regex: {info['channel_name']}")
+                    break
+        
+        # 2. Extrai ID do canal (múltiplas tentativas)
+        id_patterns = [
+            r'"channelId":"([^"]+)"',
+            r'"browseId":"([^"]+)"',
+            r'<link rel="canonical" href="https://www\.youtube\.com/channel/([^"]+)"',
+            r'"externalId":"([^"]+)"',
+            r'data-channel-external-id="([^"]+)"',
+        ]
+        
+        for pattern in id_patterns:
+            match = re.search(pattern, html)
+            if match:
+                channel_id = match.group(1)
+                if channel_id and ('UC' in channel_id or channel_id.startswith('@')):
+                    info['channel_id'] = channel_id
+                    print(f"✅ ID encontrado via regex: {info['channel_id']}")
+                    break
+        
+        # Se não encontrou ID ainda, tenta extrair da URL
+        if not info['channel_id']:
+            if '/channel/' in url:
+                match = re.search(r'/channel/([^/?]+)', url)
+                if match:
+                    info['channel_id'] = match.group(1)
+            elif '/@' in url:
+                match = re.search(r'/@([^/?]+)', url)
+                if match:
+                    info['channel_id'] = '@' + match.group(1)
+            elif '/c/' in url:
+                match = re.search(r'/c/([^/?]+)', url)
+                if match:
+                    info['channel_id'] = 'c_' + match.group(1)
+        
+        # 3. Verifica se está em live (padrões modernos)
+        live_patterns = [
+            r'"isLive":true',
+            r'"isLiveBroadcast":true',
+            r'"style":"LIVE"',
+            r'"badges":\[[^\]]*"live"[^\]]*\]',
+            r'<span[^>]*aria-label="[^"]*AO VIVO[^"]*"',
+            r'<span[^>]*class="[^"]*badge-style-type-live[^"]*"',
+            r'<link[^>]*content="https://www\.youtube\.com/watch\?v=[^"]*"[^>]*type="application/x\+youtube-live-message"',
+        ]
+        
+        for pattern in live_patterns:
+            if re.search(pattern, html, re.IGNORECASE):
+                info['is_live'] = True
+                print("🎬 Live detectada!")
+                break
+        
+        # 4. Extrai informações da live (se houver)
+        if info['is_live']:
+            # Padrões modernos para live
+            live_info_patterns = [
+                r'"videoId":"([^"]+)"[^}]*"title":\{"runs":\[\{"text":"([^"]+)"',
+                r'"videoId":"([^"]+)"[^}]*"title":\{"simpleText":"([^"]+)"',
+                r'watch\?v=([^"&]+)[^>]*title="([^"]+)"[^>]*aria-label="[^"]*AO VIVO',
+                r'<meta property="og:title" content="([^"]+)[^"]*AO VIVO[^"]*"[^>]*>\s*<meta property="og:url" content="[^"]*v=([^"&]+)"',
+            ]
             
-            info['scheduled_live'] = {
-                'id': scheduled_match.group(1),
-                'title': scheduled_match.group(3).replace('\\"', '"'),
-                'scheduled_time': formatted_time,
-                'url': f"https://youtu.be/{scheduled_match.group(1)}",
-                'thumbnail': f"https://img.youtube.com/vi/{scheduled_match.group(1)}/maxresdefault.jpg",
-                'type': 'scheduled'
-            }
+            for pattern in live_info_patterns:
+                match = re.search(pattern, html, re.IGNORECASE)
+                if match:
+                    video_id = match.group(1)
+                    title = match.group(2).replace('\\"', '"')
+                    info['live_info'] = {
+                        'id': video_id,
+                        'title': title,
+                        'url': f"https://youtu.be/{video_id}",
+                        'thumbnail': f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
+                        'type': 'live'
+                    }
+                    print(f"✅ Informações da live: {title}")
+                    break
         
-        # Extrai vídeos recentes
-        video_pattern = r'"videoId":"([^"]+)"[^}]*"title":"([^"]+)"[^}]*"thumbnail":\{[^}]*"thumbnails":\[\{[^}]*"url":"([^"]+)"[^}]*\}[^}]*\}[^}]*"publishedTimeText":\{[^}]*"simpleText":"([^"]+)"'
-        matches = re.findall(video_pattern, html)
+        # 5. Extrai vídeos recentes
+        video_patterns = [
+            r'"videoId":"([^"]+)"[^}]*"title":\{"runs":\[\{"text":"([^"]+)"[^}]*"thumbnail":\{"thumbnails":\[\{"url":"([^"]+)"',
+            r'"videoId":"([^"]+)"[^}]*"title":\{"simpleText":"([^"]+)"[^}]*"thumbnail":\{"thumbnails":\[\{"url":"([^"]+)"',
+            r'<a[^>]*href="/watch\?v=([^"&]+)"[^>]*title="([^"]+)"[^>]*><img[^>]*src="([^"]+)"',
+            r'ytInitialData["\'][^}]+"videoId":"([^"]+)"[^}]+"title":\{[^}]+\}[^}]+"thumbnail":\{[^}]+\}[^}]+"publishedTimeText":\{[^}]+\}[^}]+"simpleText":"([^"]+)"',
+        ]
         
-        videos = []
-        for match in matches[:5]:
-            videos.append({
-                'id': match[0],
-                'title': match[1].replace('\\"', '"'),
-                'thumbnail': match[2].replace('\\u0026', '&'),
-                'publish_time': match[3],
-                'url': f"https://youtu.be/{match[0]}",
-                'type': 'video'
-            })
+        for pattern in video_patterns:
+            matches = re.findall(pattern, html, re.IGNORECASE)
+            if matches:
+                print(f"📹 Encontrados {len(matches)} vídeos via regex")
+                for i, match in enumerate(matches[:5]):  # Limita a 5 vídeos
+                    video_id = match[0]
+                    title = match[1].replace('\\"', '"') if len(match) > 1 else "Vídeo recente"
+                    thumbnail = match[2].replace('\\u0026', '&') if len(match) > 2 else f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
+                    
+                    video_info = {
+                        'id': video_id,
+                        'title': title[:100] + "..." if len(title) > 100 else title,
+                        'thumbnail': thumbnail,
+                        'url': f"https://youtu.be/{video_id}",
+                        'publish_time': match[3] if len(match) > 3 else 'Recentemente',
+                        'type': 'video'
+                    }
+                    
+                    if i == 0:  # Primeiro vídeo é o mais recente
+                        info['latest_video'] = video_info
+                    
+                    info['recent_videos'].append(video_info)
+                break
         
-        if videos:
-            info['latest_video'] = videos[0]
-            info['recent_videos'] = videos
+        # 6. Se não encontrou vídeos ainda, tenta padrão mais simples
+        if not info['latest_video']:
+            simple_video_pattern = r'watch\?v=([^"&]+)'
+            video_matches = re.findall(simple_video_pattern, html)
+            if video_matches:
+                video_id = video_matches[0]  # Primeiro vídeo encontrado
+                info['latest_video'] = {
+                    'id': video_id,
+                    'title': 'Vídeo recente',
+                    'thumbnail': f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
+                    'url': f"https://youtu.be/{video_id}",
+                    'publish_time': 'Recentemente',
+                    'type': 'video'
+                }
+                print(f"✅ Vídeo encontrado via padrão simples: {video_id}")
         
+        # ========== VALIDAÇÃO FINAL ==========
+        # Se não conseguiu ID do canal, cria um baseado no nome
+        if not info['channel_id']:
+            # Cria um ID fictício baseado no nome (para funcionar no banco)
+            clean_name = re.sub(r'[^a-zA-Z0-9]', '', info['channel_name'])
+            info['channel_id'] = f"custom_{clean_name[:20]}" if clean_name else f"custom_{hash(url) % 10000}"
+            print(f"⚠️ Usando ID customizado: {info['channel_id']}")
+        
+        print(f"✅ Análise concluída: {info['channel_name']}")
         return info
         
     except Exception as e:
-        print(f"Erro ao processar HTML: {e}")
+        print(f"❌ Erro crítico ao processar {url}: {e}")
+        import traceback
+        traceback.print_exc()
     
     return info
 
